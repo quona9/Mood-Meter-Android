@@ -1,0 +1,264 @@
+# Builds the Mood Meter Android app from the web app in your Mood-Meter repo.
+# It runs on every change to this repo, or from the Actions tab: "Build Android app" > "Run workflow".
+# Each run publishes a new release with MoodMeter.apk attached.
+
+name: Build Android app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      APP_ID: io.github.quona9.moodmeter
+      VERSION_CODE: ${{ github.run_number }}
+    steps:
+      - name: Check the signing password secret
+        run: |
+          if [ ${#KEYSTORE_PASSWORD} -lt 12 ]; then
+            echo "::error::Add a repository secret named KEYSTORE_PASSWORD that is at least 12 characters long (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+
+      - name: Get this repo
+        uses: actions/checkout@v4
+
+      - name: Get the web app
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/Mood-Meter
+          path: web
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up the Capacitor project
+        run: |
+          mkdir -p build && cd build
+          cat > package.json <<'EOF'
+          {
+            "name": "mood-meter-android",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/android": "8.5.3",
+              "@capacitor/cli": "8.5.3",
+              "@capacitor/core": "8.5.3",
+              "@capacitor/local-notifications": "8.3.1"
+            }
+          }
+          EOF
+          cat > capacitor.config.json <<EOF
+          {
+            "appId": "$APP_ID",
+            "appName": "Mood Meter",
+            "webDir": "www",
+            "plugins": {
+              "LocalNotifications": { "smallIcon": "ic_stat_mood", "iconColor": "#C77DFF" },
+              "SystemBars": { "insetsHandling": "css", "initialViewportFitValueHint": "cover" }
+            }
+          }
+          EOF
+          npm install --no-audit --no-fund
+          mkdir -p www
+          cp ../web/index.html www/
+          cp -r ../web/fonts www/fonts
+          if [ -d ../web/icons ]; then cp -r ../web/icons www/icons; else cp -r ../web/Icons www/icons; fi
+          cp node_modules/@capacitor/core/dist/capacitor.js www/capacitor.js
+          cp node_modules/@capacitor/local-notifications/dist/plugin.js www/local-notifications.js
+          npx cap add android
+
+      - name: Customize the Android app
+        working-directory: build/android/app/src/main
+        run: |
+          PKG_DIR="java/$(echo "$APP_ID" | tr . /)"
+          mkdir -p "$PKG_DIR"
+
+          # Main screen: registers the file-saving helper and lets the app's own colors show behind the system bars
+          cat > "$PKG_DIR/MainActivity.java" <<EOF
+          package $APP_ID;
+
+          import android.os.Build;
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(MoodFilesPlugin.class);
+                  super.onCreate(savedInstanceState);
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      getWindow().setNavigationBarContrastEnforced(false);
+                      getWindow().setStatusBarContrastEnforced(false);
+                  }
+              }
+          }
+          EOF
+
+          # "Save as" dialog for exporting the CSV backup
+          cat > "$PKG_DIR/MoodFilesPlugin.java" <<EOF
+          package $APP_ID;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import androidx.activity.result.ActivityResult;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.ActivityCallback;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.io.OutputStream;
+          import java.nio.charset.StandardCharsets;
+
+          @CapacitorPlugin(name = "MoodFiles")
+          public class MoodFilesPlugin extends Plugin {
+              @PluginMethod
+              public void saveText(PluginCall call) {
+                  if (call.getString("text") == null) {
+                      call.reject("Nothing to save");
+                      return;
+                  }
+                  Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                  intent.addCategory(Intent.CATEGORY_OPENABLE);
+                  intent.setType("text/csv");
+                  intent.putExtra(Intent.EXTRA_TITLE, call.getString("filename", "mood-log.csv"));
+                  startActivityForResult(call, intent, "onSaved");
+              }
+
+              @ActivityCallback
+              private void onSaved(PluginCall call, ActivityResult result) {
+                  if (call == null) return;
+                  JSObject ret = new JSObject();
+                  Intent data = result.getData();
+                  if (result.getResultCode() != Activity.RESULT_OK || data == null || data.getData() == null) {
+                      ret.put("saved", false);
+                      call.resolve(ret);
+                      return;
+                  }
+                  try (OutputStream out = getContext().getContentResolver().openOutputStream(data.getData())) {
+                      out.write(call.getString("text", "").getBytes(StandardCharsets.UTF_8));
+                      ret.put("saved", true);
+                      call.resolve(ret);
+                  } catch (Exception e) {
+                      call.reject("Could not write the file", e);
+                  }
+              }
+          }
+          EOF
+
+          # App icon: the web app's icons (Android scales them for each screen)
+          rm -f res/mipmap-*/ic_launcher*.png
+          cp ../../../../www/icons/maskable-512.png res/mipmap-xxxhdpi/ic_launcher_foreground.png
+          cp ../../../../www/icons/icon-512.png res/mipmap-xxxhdpi/ic_launcher.png
+          cp ../../../../www/icons/icon-512.png res/mipmap-xxxhdpi/ic_launcher_round.png
+          cat > res/values/ic_launcher_background.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_background">#ECEBE6</color>
+          </resources>
+          EOF
+
+          # Launch screen: plain dark background with the app icon (replaces the Capacitor logo)
+          find res -name 'splash.png' -delete
+          cat > res/values/mood_colors.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="mood_bg">#191A1C</color>
+          </resources>
+          EOF
+          cat > res/drawable/splash.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/mood_bg" />
+          </shape>
+          EOF
+          cat > res/values/styles.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="Theme.AppCompat.Light.DarkActionBar">
+                  <item name="colorPrimary">@color/colorPrimary</item>
+                  <item name="colorPrimaryDark">@color/colorPrimaryDark</item>
+                  <item name="colorAccent">@color/colorAccent</item>
+              </style>
+              <style name="AppTheme.NoActionBar" parent="Theme.AppCompat.DayNight.NoActionBar">
+                  <item name="windowActionBar">false</item>
+                  <item name="windowNoTitle">true</item>
+                  <item name="android:background">@null</item>
+                  <item name="android:windowBackground">@color/mood_bg</item>
+              </style>
+              <style name="AppTheme.NoActionBarLaunch" parent="Theme.SplashScreen">
+                  <item name="android:background">@drawable/splash</item>
+                  <item name="windowSplashScreenBackground">@color/mood_bg</item>
+                  <item name="windowSplashScreenAnimatedIcon">@mipmap/ic_launcher_foreground</item>
+                  <item name="postSplashScreenTheme">@style/AppTheme.NoActionBar</item>
+              </style>
+          </resources>
+          EOF
+
+          # Small notification icon (white shapes on transparent, as Android requires)
+          cat > res/drawable/ic_stat_mood.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF" android:pathData="M3,3h8v8h-8z M13,3h8v8h-8z M3,13h8v8h-8z M13,13h8v8h-8z" />
+          </vector>
+          EOF
+
+      - name: Build the app
+        working-directory: build
+        run: |
+          npx cap sync android
+          sed -i "s/versionCode 1$/versionCode $VERSION_CODE/; s/versionName \"1.0\"/versionName \"1.0.$VERSION_CODE\"/" android/app/build.gradle
+          grep -n "versionCode\|versionName" android/app/build.gradle
+          cd android && ./gradlew assembleRelease --no-daemon
+
+      - name: Sign the app
+        run: |
+          # The signing key is created once, encrypted with your KEYSTORE_PASSWORD, and saved in this repo.
+          # Every build is signed with the same key, so new versions install over old ones.
+          if [ ! -f signing-key.enc ]; then
+            keytool -genkeypair -noprompt -keystore signing-key.p12 -storetype PKCS12 -alias moodmeter \
+              -keyalg RSA -keysize 4096 -validity 10000 -dname "CN=Mood Meter" \
+              -storepass:env KEYSTORE_PASSWORD -keypass:env KEYSTORE_PASSWORD
+            openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in signing-key.p12 -out signing-key.enc -pass env:KEYSTORE_PASSWORD
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add signing-key.enc
+            git commit -m "Add encrypted app signing key"
+            git push
+          else
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in signing-key.enc -out signing-key.p12 -pass env:KEYSTORE_PASSWORD \
+              || { echo "::error::Couldn't unlock signing-key.enc. Is KEYSTORE_PASSWORD the same password you used for the first build?"; exit 1; }
+          fi
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          "$BT/zipalign" -f -p 4 build/android/app/build/outputs/apk/release/app-release-unsigned.apk aligned.apk
+          "$BT/apksigner" sign --ks signing-key.p12 --ks-key-alias moodmeter \
+            --ks-pass env:KEYSTORE_PASSWORD --key-pass env:KEYSTORE_PASSWORD --out MoodMeter.apk aligned.apk
+          "$BT/apksigner" verify MoodMeter.apk
+          rm -f signing-key.p12 aligned.apk
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v1.0.$VERSION_CODE" MoodMeter.apk \
+            --title "Mood Meter 1.0.$VERSION_CODE" \
+            --notes "Download MoodMeter.apk on your Android phone to install or update the app."
